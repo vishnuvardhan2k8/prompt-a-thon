@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vault - Distributed Object Storage System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #030712; color: #f8fafc; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #090d16; }
+        ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+        .glass-panel { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
+        .glass-card { background: rgba(30, 41, 59, 0.4); backdrop-filter: blur(8px); border: 1px solid rgba(255, 255, 255, 0.05); }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        const REGIONS = [
+            { id: 'us-east-1', name: 'US East (N. Virginia)', color: '#3b82f6' },
+            { id: 'us-west-2', name: 'US West (Oregon)', color: '#10b981' },
+            { id: 'eu-west-1', name: 'EU West (Ireland)', color: '#8b5cf6' },
+            { id: 'ap-southeast-1', name: 'AP Southeast (Singapore)', color: '#f59e0b' }
+        ];
+
+        function generateId() {
+            return 'x' + Math.random().toString(36).substring(2, 9) + '-' + Date.now().toString(36);
+        }
+
+        function generateChecksum(data) {
+            let hash = 0;
+            for (let i = 0; i < data.length; i++) {
+                hash = (hash << 5) - hash + data.charCodeAt(i);
+                hash |= 0;
+            }
+            return Math.abs(hash).toString(16).padStart(8, '0').toUpperCase();
+        }
+
+        function createInitialNodes() {
+            const names = ['vault-node-alpha', 'vault-node-beta', 'vault-node-gamma', 'vault-node-delta', 'vault-node-epsilon', 'vault-node-zeta', 'vault-node-eta', 'vault-node-theta'];
+            return names.map((name, i) => {
+                const reg = REGIONS[i % REGIONS.length];
+                return {
+                    id: `node-${i + 1}`,
+                    name,
+                    status: 'online',
+                    capacityMb: 100000,
+                    usedMb: 5000 + Math.floor(Math.random() * 8000),
+                    region: reg.id,
+                    regionName: reg.name,
+                    regionColor: reg.color,
+                    latencyMs: 8 + Math.floor(Math.random() * 15),
+                    lastHeartbeat: Date.now(),
+                    failureCount: 0,
+                    storedChunkIds: []
+                };
+            });
+        }
+
+        function App() {
+            const [nodes, setNodes] = useState(createInitialNodes);
+            const [objects, setObjects] = useState([]);
+            const [config, setConfig] = useState({
+                replicationFactor: 3,
+                writeQuorum: 2,
+                readQuorum: 2,
+                erasureK: 4,
+                erasureM: 2,
+                storageScheme: 'replication',
+                autoRepair: true,
+                heartbeatMs: 2000
+            });
+            const [logs, setLogs] = useState([]);
+            const [activeTab, setActiveTab] = useState('dashboard');
+            const [isRunning, setIsRunning] = useState(true);
+            const [isPartitionActive, setIsPartitionActive] = useState(false);
+
+            const addLog = useCallback((type, title, details) => {
+                setLogs(prev => [{ id: generateId(), timestamp: Date.now(), type, title, details }, ...prev].slice(0, 150));
+            }, []);
+
+            const storeObject = useCallback((name, payload, scheme = 'replication') => {
+                const onlineNodes = nodes.filter(n => n.status === 'online');
+                const reqCount = scheme === 'replication' ? config.replicationFactor : (config.erasureK + config.erasureM);
+
+                if (onlineNodes.length < reqCount) {
+                    addLog('error', `Write Failed: "${name}"`, `Insufficient online nodes (${onlineNodes.length}/${reqCount}).`);
+                    return false;
+                }
+
+                const objId = generateId();
+                const chunks = [];
+
+                if (scheme === 'replication') {
+                    for (let i = 0; i < config.replicationFactor; i++) {
+                        const targetNode = onlineNodes[i % onlineNodes.length];
+                        const chunkId = `${objId}-replica-${i + 1}`;
+                        chunks.push({
+                            chunkId,
+                            nodeId: targetNode.id,
+                            nodeName: targetNode.name,
+                            type: 'full_replica',
+                            checksum: generateChecksum(payload + '-v1'),
+                            isValid: true
+                        });
+                    }
+                } else {
+                    for (let i = 0; i < config.erasureK; i++) {
+                        const targetNode = onlineNodes[i % onlineNodes.length];
+                        chunks.push({
+                            chunkId: `${objId}-data-D${i + 1}`,
+                            nodeId: targetNode.id,
+                            nodeName: targetNode.name,
+                            type: 'data',
+                            checksum: generateChecksum(payload + `-D${i + 1}`),
+                            isValid: true
+                        });
+                    }
+                    for (let j = 0; j < config.erasureM; j++) {
+                        const targetNode = onlineNodes[(config.erasureK + j) % onlineNodes.length];
+                        chunks.push({
+                            chunkId: `${objId}-parity-P${j + 1}`,
+                            nodeId: targetNode.id,
+                            nodeName: targetNode.name,
+                            type: 'parity',
+                            checksum: generateChecksum(payload + `-P${j + 1}`),
+                            isValid: true
+                        });
+                    }
+                }
+
+                const newObj = { id: objId, name, payload, scheme, chunks, status: 'healthy', createdAt: Date.now() };
+                setObjects(prev => [newObj, ...prev]);
+
+                setNodes(prev => prev.map(node => {
+                    const assigned = chunks.filter(c => c.nodeId === node.id);
+                    if (assigned.length > 0) {
+                        return { ...node, storedChunkIds: [...node.storedChunkIds, ...assigned.map(c => c.chunkId)] };
+                    }
+                    return node;
+                }));
+
+                addLog('quorum', `Object Stored: "${name}"`, `Distributed ${chunks.length} blocks across cluster.`);
+                return true;
+            }, [nodes, config, addLog]);
+
+            const retrieveObject = useCallback((objId) => {
+                const obj = objects.find(o => o.id === objId);
+                if (!obj) return;
+
+                const validChunks = obj.chunks.filter(c => {
+                    const node = nodes.find(n => n.id === c.nodeId);
+                    return c.isValid && node && node.status === 'online';
+                });
+
+                const reqMin = obj.scheme === 'replication' ? 1 : config.erasureK;
+                if (validChunks.length >= reqMin) {
+                    addLog('info', `Read Successful: "${obj.name}"`, `Verified ${validChunks.length} valid replica blocks.`);
+                } else {
+                    addLog('error', `Read Failed: "${obj.name}"`, `Only ${validChunks.length}/${reqMin} valid blocks reachable.`);
+                }
+            }, [objects, nodes, config, addLog]);
+
+            const corruptChunk = useCallback((objId, chunkId) => {
+                setObjects(prev => prev.map(o => {
+                    if (o.id === objId) {
+                        const updated = o.chunks.map(c => c.chunkId === chunkId ? { ...c, isValid: false, checksum: 'CORRUPTED' } : c);
+                        const validCount = updated.filter(c => c.isValid).length;
+                        return { ...o, chunks: updated, status: validCount < updated.length ? 'under_replicated' : 'healthy' };
+                    }
+                    return o;
+                }));
+                addLog('error', `Bit-Rot Injected`, `Corrupted block ${chunkId}.`);
+            }, [addLog]);
+
+            const toggleNode = useCallback((nodeId) => {
+                setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, status: n.status === 'online' ? 'offline' : 'online' } : n));
+            }, []);
+
+            // Heartbeat loop
+            useEffect(() => {
+                if (!isRunning) return;
+                const timer = setInterval(() => {
+                    setNodes(prev => prev.map(n => n.status === 'online' ? { ...n, latencyMs: Math.max(5, Math.floor(n.latencyMs + (Math.random() * 4 - 2))) } : n));
+                }, 2000);
+                return () => clearInterval(timer);
+            }, [isRunning]);
+
+            // Seed initial
+            useEffect(() => {
+                if (objects.length === 0) {
+                    storeObject('vault-core-config.yaml', 'ENCRYPTED_VAULT_CONFIG_KEY');
+                    storeObject('user-data-archive.tar', 'CUSTOMER_DATA_RECORDS_2026');
+                }
+            }, []);
+
+            const activeNodes = nodes.filter(n => n.status === 'online').length;
+
+            return (
+                <div className="min-h-screen flex flex-col">
+                    {/* Header */}
+                    <header className="h-16 border-b border-slate-800 bg-slate-950/80 px-6 flex items-center justify-between sticky top-0 z-30">
+                        <div className="flex items-center space-x-3">
+                            <div className="w-8 h-8 rounded-lg bg-purple-600 flex items-center justify-center font-bold text-white">V</div>
+                            <div>
+                                <h1 className="text-base font-bold text-white tracking-wide">VAULT DISTRIBUTED SYSTEM</h1>
+                                <p className="text-[10px] text-slate-400">Fault-Tolerant Object Storage</p>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center space-x-3 text-xs">
+                            <span className="px-3 py-1 rounded-full bg-slate-900 border border-slate-800 text-slate-300">
+                                Active Nodes: <strong className="text-purple-400 font-mono">{activeNodes}/{nodes.length}</strong>
+                            </span>
+                            <button
+                                onClick={() => setIsRunning(!isRunning)}
+                                className={`px-3 py-1.5 rounded-xl font-medium border ${isRunning ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-rose-500/10 text-rose-400 border-rose-500/30'}`}
+                            >
+                                {isRunning ? 'Running' : 'Paused'}
+                            </button>
+                        </div>
+                    </header>
+
+                    {/* Main Layout */}
+                    <div className="flex-1 flex overflow-hidden">
+                        {/* Sidebar */}
+                        <aside className="w-60 border-r border-slate-800 bg-slate-950/60 p-4 space-y-4">
+                            <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-400 px-2">Navigation</div>
+                            <nav className="space-y-1">
+                                {['dashboard', 'objects', 'logs'].map(tab => (
+                                    <button
+                                        key={tab}
+                                        onClick={() => setActiveTab(tab)}
+                                        className={`w-full text-left px-3 py-2 rounded-xl text-xs font-semibold capitalize transition-all ${activeTab === tab ? 'bg-purple-600/20 text-purple-300 border border-purple-500/30' : 'text-slate-400 hover:bg-slate-900'}`}
+                                    >
+                                        {tab}
+                                    </button>
+                                ))}
+                            </nav>
+                        </aside>
+
+                        {/* Content */}
+                        <main className="flex-1 overflow-y-auto p-6 space-y-6 max-w-6xl mx-auto w-full">
+                            {activeTab === 'dashboard' && (
+                                <div className="space-y-6">
+                                    <div className="grid grid-cols-3 gap-4">
+                                        <div className="p-4 rounded-2xl glass-panel space-y-1">
+                                            <div className="text-xs text-slate-400">Durability Score</div>
+                                            <div className="text-2xl font-bold font-mono text-emerald-400">99.999999999%</div>
+                                        </div>
+                                        <div className="p-4 rounded-2xl glass-panel space-y-1">
+                                            <div className="text-xs text-slate-400">Total Objects</div>
+                                            <div className="text-2xl font-bold font-mono text-purple-300">{objects.length}</div>
+                                        </div>
+                                        <div className="p-4 rounded-2xl glass-panel space-y-1">
+                                            <div className="text-xs text-slate-400">Node Quorum</div>
+                                            <div className="text-2xl font-bold font-mono text-cyan-300">{activeNodes} / {nodes.length}</div>
+                                        </div>
+                                    </div>
+
+                                    {/* Nodes Grid */}
+                                    <div className="p-5 rounded-2xl glass-panel space-y-3">
+                                        <h3 className="text-sm font-bold text-white">Cluster Storage Nodes</h3>
+                                        <div className="grid grid-cols-4 gap-3">
+                                            {nodes.map(n => (
+                                                <div
+                                                    key={n.id}
+                                                    onClick={() => toggleNode(n.id)}
+                                                    className={`p-3 rounded-xl border text-xs cursor-pointer ${n.status === 'online' ? 'bg-slate-900 border-slate-800' : 'bg-rose-950/20 border-rose-500/40'}`}
+                                                >
+                                                    <div className="font-mono font-bold text-white">{n.name}</div>
+                                                    <div className="text-[10px] text-slate-400 mt-1">{n.region}</div>
+                                                    <div className="mt-2 text-[10px] font-semibold text-purple-300">{n.storedChunkIds.length} blocks</div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {activeTab === 'objects' && (
+                                <div className="p-5 rounded-2xl glass-panel space-y-4">
+                                    <div className="flex justify-between items-center">
+                                        <h3 className="text-sm font-bold text-white">Object Store</h3>
+                                        <button
+                                            onClick={() => storeObject(`data-${Date.now()}.bin`, 'SAMPLE_PAYLOAD_DATA')}
+                                            className="px-3 py-1.5 rounded-xl bg-purple-600 text-white text-xs font-semibold"
+                                        >
+                                            + Store Object
+                                        </button>
+                                    </div>
+
+                                    <table className="w-full text-xs text-left border-collapse font-mono">
+                                        <thead>
+                                            <tr className="border-b border-slate-800 text-slate-400">
+                                                <th className="py-2">Key Name</th>
+                                                <th className="py-2">Scheme</th>
+                                                <th className="py-2">Blocks</th>
+                                                <th className="py-2 text-right">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-800/60">
+                                            {objects.map(o => (
+                                                <tr key={o.id}>
+                                                    <td className="py-2.5 font-bold text-white">{o.name}</td>
+                                                    <td className="py-2.5 uppercase text-purple-300">{o.scheme}</td>
+                                                    <td className="py-2.5">
+                                                        <div className="flex space-x-1">
+                                                            {o.chunks.map(c => (
+                                                                <span key={c.chunkId} className={`w-2.5 h-2.5 rounded-sm ${c.isValid ? 'bg-emerald-400' : 'bg-rose-500'}`} />
+                                                            ))}
+                                                        </div>
+                                                    </td>
+                                                    <td className="py-2.5 text-right space-x-2">
+                                                        <button onClick={() => retrieveObject(o.id)} className="px-2 py-1 bg-purple-500/20 text-purple-300 rounded">Read</button>
+                                                        <button onClick={() => corruptChunk(o.id, o.chunks[0].chunkId)} className="px-2 py-1 bg-rose-500/20 text-rose-300 rounded">Corrupt</button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+
+                            {activeTab === 'logs' && (
+                                <div className="p-5 rounded-2xl glass-panel space-y-2">
+                                    <h3 className="text-sm font-bold text-white mb-3">Audit Logs</h3>
+                                    {logs.map(l => (
+                                        <div key={l.id} className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 text-xs">
+                                            <div className="font-bold text-purple-300">{l.title}</div>
+                                            <div className="text-slate-400 mt-0.5">{l.details}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </main>
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
